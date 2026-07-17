@@ -1,0 +1,24 @@
+WKLEJ JEZELI PYTHON 'NIE JEST ZAINSTALOWANY'
+
+#  SZYBKI START (uzyj tego TERAZ): REM W folderze z plikiem main.py: 
+text
+
+# ---
+
+                py -m venv venv
+                venv\Scripts\activate
+                py -m pip install fastapi uvicorn pydantic sentence-transformers sqlite-utils
+
+# ---
+
+
+#  SPRAWDZ:
+text
+
+# ---
+
+                py --version
+                pip --version
+                uvicorn --version  
+
+# ---    

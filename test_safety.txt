@@ -1,0 +1,12 @@
+# Test standalone:
+python safety.py
+
+# Albo przez API:
+curl -X POST "http://localhost:8000/process" \
+  -H "Content-Type: application/json" \
+  -d '{"query": "DROP TABLE users;", "session_id": "test"}'
+
+
+Query: "hello world" → ✅ risk=0.0 OK
+Query: "DROP TABLE" → 🚫 risk=1.0 BLOCKED  
+Query: "how to make meth" → 🚫 risk=0.9 BLOCKED

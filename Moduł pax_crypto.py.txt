@@ -1,0 +1,266 @@
+Moduł: pax_crypto.py
+Ten plik zawiera wyłącznie logikę generowania bezpiecznego podpisu (hasha) oraz weryfikacji, czy nikt nie grzebał w historii stanów. Jest całkowicie niezależny od bazy danych i FastAPI – przekazujesz mu po prostu surowe słowniki/dane.
+
+
+
+---
+Już tłumaczę czarno na białym, jak to połączyć w całość!
+
+Nowy moduł `pax_crypto.py` podpinamy w dwóch kluczowych miejscach Twojej aplikacji (API i Bazy Danych): **podczas zapisu nowego stanu** oraz **podczas odczytu/weryfikacji**.
+
+Gdy rozdzielamy aplikację na warstwy (tak jak na schematach architektury oprogramowania), logika biznesowa i kontrolery API nie muszą wiedzieć, jak baza danych przechowuje bajty – po prostu używają modułu kryptograficznego jako "tłumacza".
+
+---
+
+## 🏗️ 1. Zapis stanu (Twój POST endpoint `/paxcore/snapshot/{user_id}`)
+
+Kiedy użytkownik wysyła nowy stan, robimy magię: wyliczamy hash z **jawnego** stanu, ale w bazie zapisujemy **zaszyfrowany** tekst.
+
+*Uwaga: Potrzebujesz bezpiecznego sposobu na przechowywanie klucza użytkownika (`user_key`). W produkcyjnym kodzie możesz trzymać go w osobnej tabeli (np. `user_keys`), zmiennej środowiskowej lub generować na żądanie.*
+
+```python
+from fastapi import FastAPI, HTTPException
+import json
+# Importujemy nasze nowe funkcje!
+from pax_crypto import calculate_hash, encrypt_state, generate_user_key
+
+# ... (reszta konfiguracji FastAPI i DB) ...
+
+@app.post("/paxcore/snapshot/{user_id}")
+async def save_snapshot(user_id: str, state: SSPSState):
+    st_dict = state.dict()
+    
+    # 1. Pobierz lub utwórz klucz szyfrujący dla tego użytkownika
+    # (Dla uproszczenia generujemy stały/przykładowy klucz z poziomu DB lub konfiguracji)
+    user_key = "TUTAJ_TWÓJ_KLUCZ_Z_BAZY_LUB_CONFIGU" 
+    # Wskazówka: Możesz użyć generate_user_key() przy rejestracji użytkownika!
+
+    with get_db() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        
+        # 2. Pobieramy poprzedni sequence i hash (tak jak wcześniej)
+        last = conn.execute("""
+            SELECT sequence, hash FROM snapshots 
+            WHERE user_id = ? 
+            ORDER BY sequence DESC LIMIT 1
+        """, (user_id,)).fetchone()
+        
+        sequence = (last['sequence'] + 1) if last else 1
+        prev_hash = last['hash'] if last else "genesis"
+        
+        # 3. LICZYMY HASH z JAWNEGO słownika (st_dict)
+        new_hash = calculate_hash(sequence, st_dict, prev_hash)
+        
+        # 4. SZYFRUJEMY stan przed zapisem do bazy!
+        encrypted_state = encrypt_state(st_dict, user_key)
+        
+        # 5. Zapisujemy zaszyfrowany stan do bazy danych
+        conn.execute("""
+            INSERT INTO snapshots (user_id, sequence, timestamp, state, hash) 
+            VALUES (?, ?, ?, ?, ?)
+        """, (user_id, sequence, datetime.utcnow().isoformat(), encrypted_state, new_hash))
+        
+        conn.commit()  
+    
+    return {"status": "SAVED", "sequence": sequence, "hash": new_hash}
+
+```
+
+---
+
+## 🔓 2. Odczyt stanu (Twój endpoint GET `/paxcore/replay/{user_id}/{index}`)
+
+Kiedy chcesz odtworzyć stan z bazy, musisz go najpierw **odszyfrować**, zanim wyślesz go z powrotem jako JSON.
+
+```python
+from pax_crypto import decrypt_state
+
+@app.get("/paxcore/replay/{user_id}/{index}")
+async def replay_snapshot(user_id: str, index: int):
+    user_key = "TUTAJ_TWÓJ_KLUCZ_Z_BAZY_LUB_CONFIGU"
+    
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT state FROM snapshots WHERE user_id = ? AND sequence = ?",
+            (user_id, index)
+        ).fetchone()
+        
+        if not row:
+            raise HTTPException(404, f"Snapshot {index} not found")
+        
+        # Odczytujemy zaszyfrowany ciąg z bazy
+        encrypted_state = row['state'] 
+        
+        # Odszyfrowujemy go z powrotem do czystego słownika Pythona!
+        decrypted_dict = decrypt_state(encrypted_state, user_key)
+        
+        return decrypted_dict
+
+```
+
+---
+
+## 🛡️ 3. Weryfikacja łańcucha (Twój GET `/paxcore/verify/{user_id}`)
+
+Aby sprawdzić, czy nikt nie manipulował przy danych w bazie, musimy pobrać historię, odszyfrować stany (bo weryfikujemy czy zgadzają się z jawnym hashem) i przepuścić je przez `verify_history`.
+
+```python
+from pax_crypto import verify_history, decrypt_state
+
+@app.get("/paxcore/verify/{user_id}")
+async def verify_chain(user_id: str):
+    user_key = "TUTAJ_TWÓJ_KLUCZ_Z_BAZY_LUB_CONFIGU"
+
+    with get_db() as conn:
+        history = conn.execute(
+            "SELECT sequence, state, hash FROM snapshots WHERE user_id = ? ORDER BY sequence",
+            (user_id,)
+        ).fetchall()
+        
+        if not history:
+            raise HTTPException(404, "No history")
+        
+        # Przygotowujemy listę stanów w jawnym formacie do weryfikacji
+        formatted_history = []
+        for row in history:
+            try:
+                # Odszyfrowujemy stan, żeby zweryfikować czy zgadza się z hashem
+                decrypted = decrypt_state(row['state'], user_key)
+                formatted_history.append((row['sequence'], decrypted, row['hash']))
+            except Exception:
+                return {
+                    "status": "CORRUPTED",
+                    "reason": f"Could not decrypt state at sequence {row['sequence']}. Key invalid or data tampered!"
+                }
+
+        # Wywołujemy naszą super-funkcję weryfikującą hashe i reguły przejść (Transition Rules)
+        is_valid, message = verify_history(formatted_history)
+        
+        if not is_valid:
+            return {
+                "status": "CHAIN_BROKEN_OR_ALTERED",
+                "details": message
+            }
+        
+        return {
+            "status": "OK",
+            "length": len(history),
+            "integrity": "100%"
+        }
+
+```
+
+
+---
+
+
+
+
+Aaa, już łapię o co dokładnie pytasz! Chodzi Ci o to, gdzie fizycznie podziać te klucze szyfrujące (`user_key` i `GENESIS_SALT`), żeby nie były na sztywno wpisane w kodzie i czy one w ogóle istnieją w pamięci operacyjnej podczas działania programu (w runtime).
+
+Masz absolutną rację – **trzymanie ich zahardkodowanych w pliku `.py` to proszenie się o kłopoty.**
+
+Wszystko dzieje się **w pamięci RAM (w runtime), ale tylko "w locie" (on-the-fly)** podczas przetwarzania konkretnego zapytania. Gdy FastAPI kończy obsługiwać żądanie zapisu lub odczytu, odszyfrowany stan i klucz znikają z pamięci RAM (Garbage Collector je czyści). W bazie danych zostaje tylko bezpieczny, zaszyfrowany "bełkot".
+
+Oto jak to elegancko i bezpiecznie rozwiązać w środowisku produkcyjnym:
+
+---
+
+### 1. Sól serwera (`GENESIS_SALT`) -> Plik `.env`
+
+Ten klucz jest stały dla całej aplikacji. Najlepiej wrzucić go do zmiennych środowiskowych systemu lub pliku `.env` (którego nigdy nie wrzucasz na GitHuba!).
+
+**Plik `.env`:**
+
+```env
+GENESIS_SALT=SuperTajnyKluczSerweraPaxCore2026_xYz987
+
+```
+
+**W kodzie `pax_crypto.py`:**
+
+```python
+import os
+from dotenv import load_dotenv
+
+load_dotenv()  # Wczytuje zmienne z pliku .env
+
+# Pobieramy z systemu, a jak nie ma, to dajemy bezpieczny fallback (choć na prodzie musi być!)
+GENESIS_SALT = os.getenv("GENESIS_SALT", "default_fallback_salt_for_dev")
+
+```
+
+---
+
+### 2. Klucze użytkowników (`user_key`) -> Pobierane w runtime z bazy/Vaulta
+
+Klucz użytkownika musi być unikalny dla każdej osoby korzystającej z systemu. Nie możesz mieć jednego klucza dla wszystkich, bo wyciek jednego klucza oznaczałby wyciek danych wszystkich ludzi.
+
+Kiedy użytkownik zakłada konto:
+
+1. Generujesz dla niego klucz za pomocą `generate_user_key()`.
+2. Zapisujesz ten klucz w **oddzielnej, dobrze zabezpieczonej tabeli** (np. `user_secrets`) albo w zewnętrznym menedżerze sekretów (np. HashiCorp Vault).
+
+Wtedy przepływ w runtime wygląda tak:
+
+```
+[Klient wysyła stan] 
+      │
+      ▼
+[FastAPI odbiera żądanie]
+      │
+      ├─► 1. Pobiera "user_key" z tabeli sekretów w bazie (w locie do RAMu)
+      ├─► 2. Szyfruje stan w RAMie za pomocą tego klucza
+      ├─► 3. Zapisuje ZASZYFROWANY stan do tabeli "snapshots"
+      │
+      ▼
+[Koniec żądania - RAM jest czyszczony, dane w bazie są bezpieczne]
+
+```
+
+Dzięki temu czysty stan użytkownika istnieje w pamięci serwera przez ułamek sekundy (tylko na czas wykonania funkcji), a baza danych jest w 100% odporna na bezpośredni podgląd.
+
+Czy taki podział na sekrety w `.env` i klucze w bazie brzmi dla Ciebie logicznie?
+
+
+
+---
+
+
+
+---
+
+💡 1. "Plausible Deniability" & Szyfrowanie Stanu (Crypto-Shredding)
+Obecnie stany (emocje, kontekst, ryzyko) leżą w bazie danych jako zwykły tekst JSON (row['state']). Jeśli ktoś włamie się na serwer lub dostanie dostęp do bazy, odczyta pełny profil psychologiczny użytkownika.
+
+Mój pomysł: Dodajmy do modułu kryptograficznego automatyczne szyfrowanie AES-256 dla samego stanu.
+
+Jak to działa: Hash łańcucha (blockchain) jest liczony z jawnego stanu (żeby weryfikacja działała), ale w samej bazie zapisujesz stan zaszyfrowany kluczem użytkownika.
+
+Bonus (Crypto-Shredding): Jeśli użytkownik zażąda usunięcia danych ("prawo do zapomnienia"), nie musisz kasować bazy i niszczyć łańcucha blockchain. Po prostu niszczysz jego klucz deszyfrujący. Dane stają się bezużytecznym szumem, a struktura blockchaina pozostaje nienaruszona!
+
+💡 2. Dowód Przejścia Stanu (State Transition Proof)
+W klasycznym blockchainie tylko łączysz bloki. W systemie stanów asystenta AI chcemy mieć pewność, że system nie tylko nie został zmodyfikowany, ale też że przejścia między stanami były logiczne (np. poziom zaufania nie skoczył nagle z 0.1 do 1.0 w jedną sekundę bez wyraźnego powodu).
+
+Mój pomysł: Do metadanych bloku dodajemy podpis matematyczny reguł przejścia.
+
+Do generowania hasha dorzucamy uproszczony "delta change" (podpis tego, co się zmieniło i dlaczego). Podczas weryfikacji sprawdzamy nie tylko hash, ale też czy delta nie przekracza dopuszczalnych "norm bezpieczeństwa" (np. nagły skok parametru risk o 100% bez flagi autoryzacyjnej blokuje łańcuch jako podejrzany).
+
+💡 3. Kotwiczenie Genesis (Genesis Anchoring)
+Największą słabością lokalnych łańcuchów bloków jest to, że jeśli ktoś podmieni całą bazę danych od pierwszego wpisu (stworzy alternatywny, poprawny matematycznie łańcuch od zera), to weryfikacja lokalna powie, że wszystko jest "OK".
+
+Mój pomysł: Wprowadzenie zewnętrznej kotwicy dla bloku "Genesis" (pierwszego wpisu).
+
+Gdy użytkownik zakłada konto, jego pierwszy hash ("genesis") jest podpisywany kluczem prywatnym serwera zewnętrznego lub zapisywany w bezpiecznym, odseparowanym pliku konfiguracyjnym (environment variable). Bez znajomości tej kotwicy, nikt nie jest w stanie sfałszować historii, nawet mając pełny dostęp do bazy SQLite.
+
+---
+
+Gdy przychodzi nowy stan od klienta, robisz to krok po kroku w swojej bazie danych:
+
+Pobierasz klucz szyfrujący przypisany do tego użytkownika (user_key).
+
+Generujesz nowy hash na podstawie jawnego stanu, używając calculate_hash.
+
+Szyfrujesz stan za pomocą encrypt_state – powstaje zaszyfrowany ciąg znaków (bezpieczny dla bazy).
+
+Zapisujesz do tabeli bazodanowej: user_id, sequence, encrypted_state, hash.

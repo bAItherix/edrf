@@ -1,0 +1,5 @@
+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
+
+apikey paxcore
+
+$env:GROQ_API_KEY="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"

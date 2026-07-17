@@ -1,0 +1,22 @@
+WYBIERZ NASTĘPNY MODUŁ:
+1. SAFETY LAYER (safety.py)
+
+text
+- Input injection detection
+- Length/content limits  
+- Ethical guardrails
+- Risk scoring → blokada złych query
+2. MEMORY MODULE (memory.py)
+
+text
+- sentence-transformers embeddings
+- Vector similarity search
+- Session history recall
+- Emotional context modeling
+3. AGENT DASHBOARD (dashboard.py)
+
+text
+- GET /sessions/{session_id}
+- GET /sessions (lista aktywnych)
+- DELETE /sessions/{session_id}
+- Stats + visualization
